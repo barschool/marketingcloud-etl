@@ -1,9 +1,11 @@
 import os
 import base64
 import logging
+import json
 import requests
 from datetime import datetime
 from typing import Generator
+import hashlib
 
 from sqlalchemy import create_engine, MetaData, Table, Column, Integer, String, DateTime, text
 from sqlalchemy.dialects.mysql import insert
@@ -39,6 +41,7 @@ class SalesforceExtractorBase:
         self.table_name = table_name
         self.access_token = None
         self.rest_instance_url = None
+        self.schema = os.getenv("SCHEMA", 'uat')
         self.engine = self._create_connection()
         self.metadata = MetaData()
         self._define_table()
@@ -51,7 +54,7 @@ class SalesforceExtractorBase:
         """
         return create_engine(
             f"mysql+pymysql://{os.getenv('USERNAME')}:{os.getenv('PASSWORD')}@"
-            f"{os.getenv('HOST')}:{os.getenv('PORT')}/{os.getenv('SCHEMA')}"
+            f"{os.getenv('HOST')}:{os.getenv('PORT')}/{self.schema}"
         )
     
     def _define_table(self) -> None:
@@ -60,7 +63,7 @@ class SalesforceExtractorBase:
             self.table_name,
             self.metadata,
             Column('id', Integer, primary_key=True, autoincrement=True),
-            Column('hash', String(255), unique=True, nullable=False),
+            Column('hash', String(16), nullable=False, unique=True),
             Column('lead_id', String(255)),
             Column('url', String(1024)),
             Column('session_id', String(255)),
@@ -68,17 +71,17 @@ class SalesforceExtractorBase:
             Column('date', DateTime),
             Column('type_id', String(255)),
             Column('event_category', String(255)),
-            Column('event_name', String(255)),
-            schema='uat'
+            Column('event_name', String(256)),
+            schema=self.schema
         )
     
     def _ensure_table_exists(self) -> None:
         """Create the table if it doesn't exist."""
         with self.engine.connect() as conn:
-            if not self.engine.dialect.has_table(conn, self.table_name, schema='uat'):
+            if not self.engine.dialect.has_table(conn, self.table_name, schema=self.schema):
                 self.metadata.create_all(self.engine)
-                logger.info(f"Created table: uat.{self.table_name}")
-    
+                logger.info(f"Created table: {self.schema}.{self.table_name}")
+
     def _get_auth_token(self) -> None:
         """Get authentication token from Salesforce Marketing Cloud."""
         auth_url = f"{self.auth_endpoint}"
@@ -145,28 +148,7 @@ class SalesforceExtractorBase:
         except (ValueError, TypeError) as e:
             logger.warning(f"Failed to parse date '{date_str}': {e}")
             return None
-    
-    def _generate_hash(self, item: dict) -> str:
-        """Generate a unique hash for a record based on all fields.
-        
-        Args:
-            item (dict): Item data with keys and values.
-            
-        Returns:
-            str: Base64 encoded hash.
-        """
-        # Combine all key and value fields
-        combined = ""
-        for key_name, key_value in item["keys"].items():
-            combined += str(key_value or "")
-            
-        for value_name, value_value in item["values"].items():
-            combined += str(value_value or "")
-        
-        # Encode to bytes and then to base64
-        combined_bytes = combined.encode('utf-8')
-        return base64.b64encode(combined_bytes).decode('utf-8')
-    
+       
     def _flatten_item(self, item: dict) -> dict:
         """Flatten nested keys and values into a single-level dictionary.
         
@@ -183,7 +165,9 @@ class SalesforceExtractorBase:
             "order": item["keys"].get("order", ""),
             "type_id": item["values"].get("type_id", ""),
             "event_category": item["values"].get("event_category", ""),
-            "event_name": item["values"].get("event_name", "")
+
+            # without query string and truncated to 256 chars
+            "event_name": item["values"].get("event_name", "").split("?")[0][:256]  
         }
         
         # Parse date string to datetime
@@ -191,8 +175,8 @@ class SalesforceExtractorBase:
         flattened["date"] = self._parse_date(date_str)
         
         # Add hash
-        flattened["hash"] = self._generate_hash(item)
-        
+        serialized = json.dumps(item, sort_keys=True, separators=(',', ':')).encode('utf-8')  
+        flattened["hash"] = hashlib.blake2b(serialized, digest_size=8).hexdigest()  # 8-byte hash -> 16 hex chars
         return flattened
     
     def _get_record_count(self) -> int:
@@ -203,10 +187,10 @@ class SalesforceExtractorBase:
         """
         try:
             with self.engine.connect() as conn:
-                result = conn.execute(text(f"SELECT COUNT(*) FROM uat.{self.table_name}"))
+                result = conn.execute(text(f"SELECT COUNT(*) FROM {self.schema}.{self.table_name}"))
                 return result.scalar() or 0
         except SQLAlchemyError as e:
-            logger.warning(f"Error getting record count, assuming empty table: {e}")
+            logger.warning(f"Error getting record count, assuming empty table: {e._message()}")
             return 0
     
     def _get_existing_hashes(self) -> set:
@@ -217,10 +201,10 @@ class SalesforceExtractorBase:
         """
         try:
             with self.engine.connect() as conn:
-                result = conn.execute(text(f"SELECT hash FROM uat.{self.table_name}"))
+                result = conn.execute(text(f"SELECT hash FROM {self.schema}.{self.table_name}"))
                 return {row[0] for row in result}
         except SQLAlchemyError as e:
-            logger.warning(f"Error getting existing hashes, assuming empty table: {e}")
+            logger.warning(f"Error getting existing hashes, assuming empty table: {e._message()}")
             return set()
     
     def _batch_insert(self, records: list[dict]) -> int:
@@ -251,7 +235,7 @@ class SalesforceExtractorBase:
             return inserted_count
         
         except SQLAlchemyError as e:
-            logger.error(f"Error in bulk insert: {e}")
+            logger.error(f"Error in bulk insert: {e._message()}")
             raise
         except Exception as e:
             logger.error(f"Unexpected error during bulk insert: {e}")
@@ -428,11 +412,11 @@ class SalesforceLeadActivity(SalesforceExtractorBase):
         # Clear existing table data for bulk mode
         try:
             with self.engine.connect() as conn:
-                conn.execute(text(f"TRUNCATE TABLE uat.{self.table_name}"))
+                conn.execute(text(f"TRUNCATE TABLE {self.schema}.{self.table_name}"))
                 conn.commit()
-                logger.info(f"Truncated table: uat.{self.table_name}")
+                logger.info(f"Truncated table: {self.schema}.{self.table_name}")
         except SQLAlchemyError as e:
-            logger.warning(f"Error truncating table (it may not exist yet): {e}")
+            logger.warning(f"Error truncating table (it may not exist yet): {e._message()}")
         
         # Create page generator 
         pages_generator = self._get_bulk_page_generator()
