@@ -1,0 +1,21 @@
+// See https://aka.ms/vscode-remote/devcontainer.json for format details.
+{
+  "name": "Docker Compose",
+  "build": {
+  "dockerfile": "../Dockerfile",
+  "context": ".."
+  },
+  "runArgs": ["--env-file",".devcontainer/devcontainer.env"],
+  "mounts": [
+    "source=${localWorkspaceFolder}/,target=/workspace,type=bind,consistency=cached"
+  ],
+  "workspaceFolder": "/workspace",
+  "customizations": {
+    "vscode": { 
+      "extensions": [
+        "ms-python.python"
+      ]
+    }
+  }
+}
+  
