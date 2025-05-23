@@ -1,13 +1,13 @@
 import os
-import base64
 import logging
 import json
 import requests
 from datetime import datetime
 from typing import Generator
 import hashlib
+import math
 
-from sqlalchemy import create_engine, MetaData, Table, Column, Integer, String, DateTime, text
+from sqlalchemy import create_engine, MetaData, Table, Column, Integer, String, DateTime, text, inspect
 from sqlalchemy.dialects.mysql import insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.engine import Engine
@@ -77,9 +77,10 @@ class SalesforceExtractorBase:
     
     def _ensure_table_exists(self) -> None:
         """Create the table if it doesn't exist."""
-        with self.engine.connect() as conn:
-            if not self.engine.dialect.has_table(conn, self.table_name, schema=self.schema):
-                self.metadata.create_all(self.engine)
+        with self.engine.begin() as conn:  # begin() ensures transaction handling
+            inspector = inspect(conn)
+            if not inspector.has_table(self.table_name, schema=self.schema):
+                self.metadata.create_all(bind=conn)
                 logger.info(f"Created table: {self.schema}.{self.table_name}")
 
     def _get_auth_token(self) -> None:
@@ -192,27 +193,12 @@ class SalesforceExtractorBase:
         except SQLAlchemyError as e:
             logger.warning(f"Error getting record count, assuming empty table: {e._message()}")
             return 0
-    
-    def _get_existing_hashes(self) -> set:
-        """Get set of existing hashes from the database.
-        
-        Returns:
-            set: Set of hash values already in the database
-        """
-        try:
-            with self.engine.connect() as conn:
-                result = conn.execute(text(f"SELECT hash FROM {self.schema}.{self.table_name}"))
-                return {row[0] for row in result}
-        except SQLAlchemyError as e:
-            logger.warning(f"Error getting existing hashes, assuming empty table: {e._message()}")
-            return set()
-    
+
     def _batch_insert(self, records: list[dict]) -> int:
         """Insert records in batches to avoid memory issues.
         
         Args:
             records (list): List of records to insert
-            batch_size (int): Batch size for insertion - only used for fallback
             
         Returns:
             int: Number of records inserted
@@ -223,31 +209,32 @@ class SalesforceExtractorBase:
             return 0
         
         try:
-            # Direct bulk insert without re-batching
             with self.engine.connect() as conn:
-                result = conn.execute(
-                    insert(self.table).values(records)
+                # Use MySQL's `insert...on duplicate key update` to handle duplicates
+                stmt = insert(self.table).values(records)
+                on_duplicate_stmt = stmt.on_duplicate_key_update(
+                    hash=stmt.inserted.hash  # No-op update to avoid duplicate insertion
                 )
+                _result = conn.execute(on_duplicate_stmt)
                 conn.commit()
                 
             inserted_count = len(records)
-            logger.info(f"Bulk inserted {inserted_count} records in one operation")
+            logger.info(f"Attempted to insert {inserted_count} records (duplicates ignored by DB)")
             return inserted_count
         
         except SQLAlchemyError as e:
-            logger.error(f"Error in bulk insert: {e._message()}")
+            logger.error(f"Error in batch insert: {e._message()}")
             raise
         except Exception as e:
-            logger.error(f"Unexpected error during bulk insert: {e}")
-            raise 
-            
+            logger.error(f"Unexpected error during batch insert: {e}")
+            raise
             
 
 
 class SalesforceLeadActivity(SalesforceExtractorBase):
     """Class for extracting Lead Activity data from Salesforce Marketing Cloud API."""
     
-    def __init__(self, mode: str = "bulk") -> None:
+    def __init__(self, mode: str = "bulk", ) -> None:
         """Initialize the Lead Activity extractor.
         
         Args:
@@ -258,35 +245,9 @@ class SalesforceLeadActivity(SalesforceExtractorBase):
             table_name="salesforce_lead_activity"
         )
         self.mode = mode
-        self.page_size = 2500  # As per API response
+        self.page_size = 2500  # As per API response  
     
-    def _get_bulk_page_generator(self) -> Generator[dict, None, None]:
-        """Generate API response pages one at a time.
-        
-        Args:
-            total_pages (int): Total number of pages to fetch
-            base_url (str): Base URL for API requests
-            
-        Yields:
-            dict: API response data for each page
-        """
-        base_url = f"{self.data_endpoint}"
-        
-        # Make first request to get total count
-        logger.info("Fetching first page to determine total records")
-        first_page = self._fetch_page(f"{base_url}?$page=1")
-        
-        total_count = first_page.get("count", 0)
-        total_pages = (total_count // self.page_size) + (1 if total_count % self.page_size > 0 else 0)
-        logger.info(f"Total records: {total_count}, Total pages: {total_pages}")
-
-        for page in range(1, total_pages + 1):
-            logger.info(f"Fetching page {page} of {total_pages}")
-            url = f"{base_url}?$page={page}"
-            yield self._fetch_page(url)
-    
-    
-    def _get_incremental_page_generator(self, db_record_count: int) -> Generator[dict, None, None] | None:
+    def _get_page_generator(self, db_record_count: int = 0) -> Generator[dict, None, None] | None:
         """Generate API response pages one at a time for new records.
         
         Fetches only the latest pages that contain new records, starting from
@@ -298,37 +259,26 @@ class SalesforceLeadActivity(SalesforceExtractorBase):
         Yields:
             dict: API response data for each page containing new records
         """
-        base_url = f"{self.data_endpoint}"
         
         # Make first request to get total count
-        logger.info("Fetching first page to determine total records")
-        first_page = self._fetch_page(f"{base_url}?$page=1")
+        start_page = max(1, math.ceil(db_record_count / self.page_size))
+        first_page = self._fetch_page(f"{self.data_endpoint}?$page=1")
         
         # Get total record count from API
         api_record_count = first_page.get("count", 0)
-        total_pages = (api_record_count // self.page_size) + (1 if api_record_count % self.page_size > 0 else 0)
-        logger.info(f"API record count: {api_record_count}, Total pages: {total_pages}")
-        
-        # Calculate difference and pages needed
-        records_difference = max(0, api_record_count - db_record_count)
-        pages_needed = (records_difference // self.page_size) + (1 if records_difference % self.page_size > 0 else 0)
-        
-        if records_difference <= 0:
+        total_pages = math.ceil(api_record_count / self.page_size)
+
+        if api_record_count > db_record_count:
+            total_pages = math.ceil(api_record_count / self.page_size)
+            logger.info(f"Starting from page {start_page} to get newest records")
+            
+            # Fetch pages from start_page to total_pages to get newest records
+            for page in range(start_page, total_pages):
+                logger.info(f"Fetching page {page} of {total_pages}")
+                yield self._fetch_page(f"{self.data_endpoint}?$page={page}")
+        else:
             logger.info("No new records to extract")
-            return None
-        
-        # Calculate the starting page (newest records are in the latest pages)
-        start_page = max(1, total_pages - pages_needed + 1)
-        
-        logger.info(f"Records difference: {records_difference}, Pages needed: {pages_needed}")
-        logger.info(f"Starting from page {start_page} to get newest records")
-        
-        # Fetch pages from start_page to total_pages to get newest records
-        for page in range(start_page, total_pages + 1):
-            logger.info(f"Fetching page {page} of {total_pages}")
-            url = f"{base_url}?$page={page}"
-            yield self._fetch_page(url)
-    
+
     def _process_page_items(self, response_data: dict) -> Generator[dict, None, None]:
         """Process items from a page and yield flattened records.
         
@@ -343,13 +293,11 @@ class SalesforceLeadActivity(SalesforceExtractorBase):
             yield self._flatten_item(item)
     
     def _process_items_batch(self, pages_generator: Generator[dict, None, None] | None, 
-                             existing_hashes: set | None = None, 
                              batch_size: int = 2500) -> None:
         """Process items from pages generator and insert in batches.
         
         Args:
             pages_generator (Generator): Generator of API response pages
-            existing_hashes (set, optional): Set of hashes to filter against
             batch_size (int): Size of batches for DB insertion
         """
         if pages_generator is None:
@@ -364,11 +312,6 @@ class SalesforceLeadActivity(SalesforceExtractorBase):
             # Process each item in the page
             for record in self._process_page_items(response_data):
                 total_processed += 1
-                
-                # Skip if hash already exists in database (for incremental mode)
-                if existing_hashes is not None and record["hash"] in existing_hashes:
-                    continue
-                    
                 records_batch.append(record)
                 
                 # Insert batch when it reaches batch_size
@@ -395,11 +338,9 @@ class SalesforceLeadActivity(SalesforceExtractorBase):
         self._get_auth_token()
         self._ensure_table_exists()
         
-        base_url = f"{self.data_endpoint}"
-        
         # Make first request to get total count
         logger.info("Fetching first page to determine total records")
-        first_page = self._fetch_page(f"{base_url}?$page=1")
+        first_page = self._fetch_page(f"{self.data_endpoint}?$page=1")
         
         total_count = first_page.get("count", 0)
         total_pages = (total_count // self.page_size) + (1 if total_count % self.page_size > 0 else 0)
@@ -419,12 +360,11 @@ class SalesforceLeadActivity(SalesforceExtractorBase):
             logger.warning(f"Error truncating table (it may not exist yet): {e._message()}")
         
         # Create page generator 
-        pages_generator = self._get_bulk_page_generator()
+        pages_generator = self._get_page_generator()
         
         # Process all pages
         self._process_items_batch(
             pages_generator,  # Include first page
-            existing_hashes=None,  # No filtering in bulk mode
             batch_size=2500
         )
         
@@ -439,18 +379,16 @@ class SalesforceLeadActivity(SalesforceExtractorBase):
         self._get_auth_token()
         self._ensure_table_exists()
         
-        # Get existing hashes and record count from database
-        existing_hashes = self._get_existing_hashes()
+        # Get record count from database
         db_record_count = self._get_record_count()
         logger.info(f"Current database record count: {db_record_count}")
         
         # Only fetch the needed pages
-        pages_generator = self._get_incremental_page_generator(db_record_count)
+        pages_generator = self._get_page_generator(db_record_count)
         
-        # Process pages with filtering based on existing hashes
+        # Process pages without filtering based on existing hashes
         self._process_items_batch(
             pages_generator,  # Include first page
-            existing_hashes=existing_hashes,  # Filter against existing hashes
             batch_size=2500
         )
         
