@@ -270,10 +270,10 @@ class SalesforceLeadActivity(SalesforceExtractorBase):
 
         if api_record_count > db_record_count:
             total_pages = math.ceil(api_record_count / self.page_size)
-            logger.info(f"Starting from page {start_page} to get newest records")
+            logger.info(f"Starting from page {start_page} to get newest records, total records: {api_record_count}")
             
             # Fetch pages from start_page to total_pages to get newest records
-            for page in range(start_page, total_pages):
+            for page in range(start_page, total_pages + 1):
                 logger.info(f"Fetching page {page} of {total_pages}")
                 yield self._fetch_page(f"{self.data_endpoint}?$page={page}")
         else:
